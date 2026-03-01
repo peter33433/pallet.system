@@ -6,6 +6,8 @@ import datetime, uuid, os, io
 import barcode
 from barcode.writer import ImageWriter
 from reportlab.pdfgen import canvas
+import csv
+from flask import send_file
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///pallets.db'
@@ -57,7 +59,24 @@ def index():
     pallets_created = Pallet.query.filter_by(status="CREATED").all()
     html = """
     <html>
-    <head><title>Správa paliet</title></head>
+    <head>
+    <title>Správa paliet</title>
+    <style>
+    body {
+        font-size: 18px;  /* základná veľkosť písma */
+        font-family: Arial, sans-serif;
+    }
+    h2, h3 {
+        font-size: 22px;  /* nadpisy väčšie */
+    }
+    table {
+        font-size: 16px;  /* tabuľky čitateľnejšie */
+    }
+    input, select, button {
+        font-size: 16px;  /* formuláre väčšie */
+    }
+    </style>
+    </head>
     <body>
     <h2>Správa paliet</h2>
 
@@ -86,7 +105,11 @@ def index():
     <form action="/print_all" method="post">
     <input type="submit" value="Tlač všetkých lejblov">
     </form>
-
+    <h3>Správa vytvorených lejblov</h3>
+    <form action="/delete_unprocessed" method="post" onsubmit="return confirm('Naozaj chcete vymazať všetky nevytlačené / nespracované palety?');">
+    <input type="submit" value="Vymazať palety">
+    </form>
+    
     <table border=1>
     <tr><th>ID</th><th>Barcode</th><th>Material</th><th>Typ</th><th>Dodávateľ</th><th>Lejbl PDF</th></tr>
     {% for p in pallets_created %}
@@ -152,7 +175,13 @@ def print_all():
         db.session.commit()
         generate_label_pdf(p)
     return f"Všetky lejblí boli vytlačené. <br><a href='/'>Späť</a>"
-
+# Vymazanie lejblov
+@app.route("/delete_unprocessed", methods=["POST"])
+def delete_unprocessed():
+    # Vymaže všetky palety so stavom CREATED alebo PRINTED
+    deleted_count = Pallet.query.filter(Pallet.status.in_(["CREATED", "PRINTED"])).delete(synchronize_session=False)
+    db.session.commit()
+    return f"Vymazaných paliet: {deleted_count} <br><a href='/'>Späť na hlavnú stránku</a>"
 # Podstránka pridávanie váhy
 @app.route("/add_weight")
 def add_weight_page():
@@ -266,21 +295,43 @@ def mark_processed():
 def report_page():
     supplier = request.args.get("supplier","All")
     position = request.args.get("position","All")
+    
+    inprocess_from = request.args.get("inprocess_from","")
+    inprocess_to = request.args.get("inprocess_to","")
+    
+    processed_from = request.args.get("processed_from","")
+    processed_to = request.args.get("processed_to","")
 
-    query = Pallet.query
-
+    # Query pre IN_PROCESS
+    query_inprocess = Pallet.query.filter_by(status="IN_PROCESS")
     if supplier != "All":
-        query = query.filter_by(supplier=supplier)
+        query_inprocess = query_inprocess.filter_by(supplier=supplier)
     if position != "All":
-        query = query.filter_by(process_position=position)
+        query_inprocess = query_inprocess.filter_by(process_position=position)
+    if inprocess_from:
+        query_inprocess = query_inprocess.filter(Pallet.created_at >= inprocess_from)
+    if inprocess_to:
+        query_inprocess = query_inprocess.filter(Pallet.created_at <= inprocess_to)
+    pallets_inprocess = query_inprocess.all()
 
-    pallets = query.all()
+    # Query pre PROCESSED
+    query_processed = Pallet.query.filter_by(status="PROCESSED")
+    if supplier != "All":
+        query_processed = query_processed.filter_by(supplier=supplier)
+    if position != "All":
+        query_processed = query_processed.filter_by(process_position=position)
+    if processed_from:
+        query_processed = query_processed.filter(Pallet.processed_at >= processed_from)
+    if processed_to:
+        query_processed = query_processed.filter(Pallet.processed_at <= processed_to)
+    pallets_processed = query_processed.all()
 
     html = """
     <html>
     <head><title>Report paliet</title></head>
     <body>
     <h2>Report paliet</h2>
+
     <form method="get">
         Filter podľa dodávateľa: 
         <select name="supplier" onchange="this.form.submit()">
@@ -297,12 +348,20 @@ def report_page():
             <option value="LTR2" {% if position=="LTR2" %}selected{% endif %}>LTR2</option>
             <option value="sorting" {% if position=="sorting" %}selected{% endif %}>sorting</option>
         </select>
+
+        <h4>Palety v procese – filter podľa dátumu vytvorenia</h4>
+        Od: <input type="date" name="inprocess_from" value="{{inprocess_from}}" onchange="this.form.submit()">
+        Do: <input type="date" name="inprocess_to" value="{{inprocess_to}}" onchange="this.form.submit()">
+
+        <h4>Spracované palety – filter podľa dátumu spracovania</h4>
+        Od: <input type="date" name="processed_from" value="{{processed_from}}" onchange="this.form.submit()">
+        Do: <input type="date" name="processed_to" value="{{processed_to}}" onchange="this.form.submit()">
     </form>
 
     <h3>Palety v procese (IN_PROCESS)</h3>
     <table border=1>
-    <tr><th>ID</th><th>Barcode</th><th>Material</th><th>Typ</th><th>Dodávateľ</th><th>Váha</th><th>Pozícia</th></tr>
-    {% for p in pallets if p.status=="IN_PROCESS" %}
+    <tr><th>ID</th><th>Barcode</th><th>Material</th><th>Typ</th><th>Dodávateľ</th><th>Váha</th><th>Pozícia</th><th>Dátum vytvorenia</th></tr>
+    {% for p in pallets_inprocess %}
     <tr>
     <td>{{p.id}}</td>
     <td>{{p.barcode}}</td>
@@ -311,6 +370,7 @@ def report_page():
     <td>{{p.supplier}}</td>
     <td>{{p.weight}}</td>
     <td>{{p.process_position}}</td>
+    <td>{{p.created_at}}</td>
     </tr>
     {% endfor %}
     </table>
@@ -318,7 +378,7 @@ def report_page():
     <h3>Spracované palety (PROCESSED)</h3>
     <table border=1>
     <tr><th>ID</th><th>Barcode</th><th>Material</th><th>Typ</th><th>Dodávateľ</th><th>Váha</th><th>Pozícia</th><th>Dátum spracovania</th></tr>
-    {% for p in pallets if p.status=="PROCESSED" %}
+    {% for p in pallets_processed %}
     <tr>
     <td>{{p.id}}</td>
     <td>{{p.barcode}}</td>
@@ -336,8 +396,64 @@ def report_page():
     </body>
     </html>
     """
-    return render_template_string(html, pallets=pallets, supplier=supplier)
+    return render_template_string(html,
+                                  pallets_inprocess=pallets_inprocess,
+                                  pallets_processed=pallets_processed,
+                                  supplier=supplier,
+                                  position=position,
+                                  inprocess_from=inprocess_from,
+                                  inprocess_to=inprocess_to,
+                                  processed_from=processed_from,
+                                  processed_to=processed_to)
+#--------- Čistenie databázy-------------
+@app.route("/cleanup", methods=["GET", "POST"])
+def cleanup():
+    if request.method == "GET":
+        # Zobrazenie tlačidla na stránke reportu
+        html = """
+        <html>
+        <head><title>Údržba paliet</title></head>
+        <body>
+        <h2>Údržba paliet</h2>
+        <p>Vymaže palety staršie ako 30 dní a uloží ich zálohu do CSV.</p>
+        <form method="post">
+            <input type="submit" value="Stiahnuť a vymazať staré palety">
+        </form>
+        <a href="/report_page"><button>Späť na report</button></a>
+        </body>
+        </html>
+        """
+        return html
 
+    elif request.method == "POST":
+        # Dátum pred 30 dňami
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=30)
+
+        # Vybrať všetky palety staršie ako 30 dní
+        old_pallets = Pallet.query.filter(
+            (Pallet.status=="PROCESSED") & (Pallet.processed_at <= cutoff) |
+            (Pallet.status=="IN_PROCESS") & (Pallet.created_at <= cutoff)
+        ).all()
+
+        if not old_pallets:
+            return "Žiadne palety staršie ako 30 dní <br><a href='/cleanup'>Späť</a>"
+
+        # Uloženie do CSV
+        filename = f"pallets_backup_{datetime.datetime.utcnow().strftime('%Y%m%d')}.csv"
+        with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["ID","Barcode","Material","Typ","Dodávateľ","Váha","Pozícia","Status","Vytvorené","Spracované"])
+            for p in old_pallets:
+                writer.writerow([p.id, p.barcode, p.material, p.pallet_type, p.supplier,
+                                 p.weight, p.process_position, p.status,
+                                 p.created_at, p.processed_at])
+
+        # Vymazanie z DB
+        for p in old_pallets:
+            db.session.delete(p)
+        db.session.commit()
+
+        return send_file(filename, as_attachment=True)
 # ------------------ SPUSTENIE ------------------
 def open_browser():
     webbrowser.open_new("http://127.0.0.1:5000/")
